@@ -1,0 +1,524 @@
+import { useState, useEffect, useCallback } from "react";
+
+const SUPABASE_URL = "https://nsxaudgsxbczwecmmulv.supabase.co";
+const SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im5zeGF1ZGdzeGJjendlY21tdWx2Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzgxNTkwNzMsImV4cCI6MjA5MzczNTA3M30.QvAq7ePQaP3vZJU6CHGtJA8454k9CjL-X9RZ5rpWoxM";
+const PIN_STORAGE_KEY = "lethal_pin";
+const DEFAULT_PIN = "1234";
+
+const headers = {
+  "Content-Type": "application/json",
+  "apikey": SUPABASE_KEY,
+  "Authorization": `Bearer ${SUPABASE_KEY}`,
+  "Prefer": "return=representation"
+};
+
+async function sbGet(table, query = "") {
+  const res = await fetch(`${SUPABASE_URL}/rest/v1/${table}${query}`, { headers });
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+async function sbPost(table, body) {
+  const res = await fetch(`${SUPABASE_URL}/rest/v1/${table}`, { method: "POST", headers, body: JSON.stringify(body) });
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+async function sbDelete(table, query) {
+  const res = await fetch(`${SUPABASE_URL}/rest/v1/${table}${query}`, { method: "DELETE", headers });
+  if (!res.ok) throw new Error(await res.text());
+}
+
+function formatPhone(val) {
+  const d = val.replace(/\D/g, "").slice(0, 10);
+  if (d.length <= 3) return d;
+  if (d.length <= 6) return `(${d.slice(0,3)}) ${d.slice(3)}`;
+  return `(${d.slice(0,3)}) ${d.slice(3,6)}-${d.slice(6)}`;
+}
+function formatDateTime(dateStr, timeStr) {
+  const date = new Date(`${dateStr}T${timeStr}`);
+  return date.toLocaleString("en-US", { weekday: "short", month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
+}
+function exportCSV(cls, enrolled, waitlist) {
+  const rows = [["Type","Name","Phone"], ...enrolled.map(s=>["Enrolled",s.name,s.phone]), ...waitlist.map(s=>["Waitlist",s.name,s.phone])];
+  const csv = rows.map(r=>r.map(c=>`"${c}"`).join(",")).join("\n");
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([csv],{type:"text/csv"}));
+  a.download = `${cls.title.replace(/\s+/g,"_")}_roster.csv`;
+  a.click();
+}
+
+const S = {
+  page: { minHeight:"100vh", background:"#080808", fontFamily:"'Inter',sans-serif", color:"#fff" },
+  input: { background:"#0d0d0d", border:"1px solid #222", borderRadius:8, color:"#fff", padding:"9px 12px", fontSize:13, outline:"none", width:"100%", boxSizing:"border-box", fontFamily:"inherit" },
+  btnGreen: { background:"linear-gradient(90deg,#39ff14,#00cc00)", color:"#000", border:"none", borderRadius:8, padding:"10px 24px", fontWeight:800, fontSize:14, cursor:"pointer", letterSpacing:1 },
+  btnGhost: { background:"transparent", border:"1px solid #252525", color:"#666", borderRadius:8, padding:"6px 14px", fontSize:12, cursor:"pointer", letterSpacing:1 },
+};
+
+function Spinner() {
+  return <div style={{width:20,height:20,border:"2px solid #222",borderTop:"2px solid #39ff14",borderRadius:"50%",animation:"spin 0.7s linear infinite"}} />;
+}
+
+function Badge({ count, max }) {
+  const pct = max>0 ? count/max : 0;
+  const color = pct>=1 ? "#ff3b3b" : pct>=0.75 ? "#ff9500" : "#39ff14";
+  return <span style={{background:color,color:"#000",borderRadius:4,padding:"2px 8px",fontSize:11,fontWeight:800,letterSpacing:1,whiteSpace:"nowrap"}}>{count}/{max}</span>;
+}
+
+// ── Class Card ────────────────────────────────────────────────────────────────
+function ClassCard({ cls, signups, isCoach, onRefresh }) {
+  const enrolled = signups.filter(s => s.class_id === cls.id && s.type === "enrolled");
+  const waitlist = signups.filter(s => s.class_id === cls.id && s.type === "waitlist");
+  const full = enrolled.length >= cls.capacity;
+  const [open, setOpen] = useState(false);
+  const [name, setName] = useState("");
+  const [phone, setPhone] = useState("");
+  const [err, setErr] = useState("");
+  const [success, setSuccess] = useState(null); // null | 'enrolled' | 'waitlist'
+  const [expanded, setExpanded] = useState(false);
+  const [loading, setLoading] = useState(false);
+
+  async function handleSignup() {
+    if (!name.trim()) return setErr("Name is required.");
+    if (phone.replace(/\D/g,"").length < 10) return setErr("Enter a valid 10-digit phone number.");
+    const ph = phone.replace(/\D/g,"");
+    if (signups.find(s => s.class_id===cls.id && s.phone.replace(/\D/g,"")===ph)) return setErr("This number is already registered.");
+    setLoading(true);
+    const type = full ? "waitlist" : "enrolled";
+    try {
+      await sbPost("signups", { class_id: cls.id, name: name.trim(), phone, type });
+      setSuccess(type);
+      onRefresh();
+    } catch(e) { setErr("Something went wrong. Try again."); }
+    setLoading(false);
+  }
+
+  async function handleRemove(id) {
+    await sbDelete("signups", `?id=eq.${id}`);
+    onRefresh();
+  }
+
+  async function handlePromote() {
+    if (waitlist.length === 0) return;
+    const first = waitlist[0];
+    await fetch(`${SUPABASE_URL}/rest/v1/signups?id=eq.${first.id}`, {
+      method:"PATCH", headers, body: JSON.stringify({ type:"enrolled" })
+    });
+    onRefresh();
+  }
+
+  async function handleDeleteClass() {
+    if (!confirm(`Delete "${cls.title}"? This cannot be undone.`)) return;
+    await sbDelete("classes", `?id=eq.${cls.id}`);
+    onRefresh();
+  }
+
+  return (
+    <div style={{background:"linear-gradient(135deg,#141414,#0e0e0e)",border:"1px solid #1e1e1e",borderRadius:14,overflow:"hidden",transition:"transform 0.15s,box-shadow 0.15s"}}
+      onMouseEnter={e=>{e.currentTarget.style.transform="translateY(-2px)";e.currentTarget.style.boxShadow="0 8px 40px rgba(57,255,20,0.1)";}}
+      onMouseLeave={e=>{e.currentTarget.style.transform="none";e.currentTarget.style.boxShadow="none";}}>
+      <div style={{background:"linear-gradient(90deg,#39ff14,#00cc00)",height:3}} />
+      <div style={{padding:"20px 24px"}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:12}}>
+          <div style={{flex:1}}>
+            <div style={{fontSize:20,fontWeight:800,color:"#fff",fontFamily:"'Bebas Neue',sans-serif",letterSpacing:1.5}}>{cls.title}</div>
+            <div style={{color:"#666",fontSize:13,marginTop:3}}>🕐 {formatDateTime(cls.date,cls.time)} · {cls.duration} min</div>
+            {cls.coach && <div style={{color:"#555",fontSize:12,marginTop:2}}>Coach: {cls.coach}</div>}
+          </div>
+          <div style={{display:"flex",flexDirection:"column",alignItems:"flex-end",gap:4}}>
+            <Badge count={enrolled.length} max={cls.capacity} />
+            {waitlist.length > 0 && <span style={{fontSize:11,color:"#ff9500",fontWeight:700}}>⏳ {waitlist.length} waiting</span>}
+          </div>
+        </div>
+
+        {cls.description && (
+          <div style={{marginTop:12,color:"#666",fontSize:13,lineHeight:1.7,borderLeft:"2px solid #39ff14",paddingLeft:12}}>
+            {cls.description}
+          </div>
+        )}
+
+        {/* Coach view */}
+        {isCoach && (
+          <div style={{marginTop:16}}>
+            <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
+              <button onClick={()=>setExpanded(e=>!e)} style={{...S.btnGhost,fontSize:12,padding:"5px 12px"}}>
+                {expanded?"▲ HIDE":"▼ SHOW"} ROSTER ({enrolled.length})
+              </button>
+              <button onClick={()=>exportCSV(cls,enrolled,waitlist)} style={{...S.btnGhost,color:"#39ff14",borderColor:"#1a3a1a",fontSize:12,padding:"5px 12px"}}>
+                ⬇ CSV
+              </button>
+            </div>
+
+            {expanded && (
+              <div style={{marginTop:12}}>
+                <div style={{fontSize:11,color:"#444",letterSpacing:1,fontWeight:700,marginBottom:6}}>ENROLLED ({enrolled.length})</div>
+                {enrolled.length===0
+                  ? <div style={{color:"#333",fontSize:13,marginBottom:8}}>No students yet.</div>
+                  : enrolled.map((s,i)=>(
+                    <div key={s.id} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"6px 0",borderBottom:"1px solid #161616",fontSize:13}}>
+                      <div><span style={{color:"#ddd"}}>{s.name}</span><span style={{color:"#444",marginLeft:12}}>{s.phone}</span></div>
+                      <button onClick={()=>handleRemove(s.id)} style={{background:"transparent",color:"#ff3b3b",border:"1px solid #2a0a0a",borderRadius:5,padding:"2px 9px",fontSize:11,cursor:"pointer",fontWeight:600}}>REMOVE</button>
+                    </div>
+                  ))
+                }
+
+                {waitlist.length > 0 && <>
+                  <div style={{fontSize:11,color:"#444",letterSpacing:1,fontWeight:700,margin:"14px 0 6px"}}>WAITLIST ({waitlist.length})</div>
+                  {waitlist.map((s,i)=>(
+                    <div key={s.id} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"6px 0",borderBottom:"1px solid #161616",fontSize:13}}>
+                      <div>
+                        <span style={{color:"#ff9500",marginRight:8}}>#{i+1}</span>
+                        <span style={{color:"#ddd"}}>{s.name}</span>
+                        <span style={{color:"#444",marginLeft:12}}>{s.phone}</span>
+                      </div>
+                      <div style={{display:"flex",gap:6}}>
+                        {i===0 && enrolled.length < cls.capacity && (
+                          <button onClick={handlePromote} style={{background:"rgba(57,255,20,0.08)",color:"#39ff14",border:"1px solid #1a3a1a",borderRadius:5,padding:"2px 9px",fontSize:11,cursor:"pointer",fontWeight:600}}>PROMOTE</button>
+                        )}
+                        <button onClick={()=>handleRemove(s.id)} style={{background:"transparent",color:"#ff3b3b",border:"1px solid #2a0a0a",borderRadius:5,padding:"2px 9px",fontSize:11,cursor:"pointer",fontWeight:600}}>REMOVE</button>
+                      </div>
+                    </div>
+                  ))}
+                </>}
+              </div>
+            )}
+            <button onClick={handleDeleteClass} style={{marginTop:14,background:"transparent",color:"#ff3b3b",border:"1px solid #2a0a0a",borderRadius:6,padding:"5px 12px",fontSize:12,cursor:"pointer",fontWeight:600}}>
+              Delete Class
+            </button>
+          </div>
+        )}
+
+        {/* Student signup */}
+        {!isCoach && (
+          <div style={{marginTop:14}}>
+            {success==="enrolled" && (
+              <div style={{background:"rgba(57,255,20,0.08)",border:"1px solid #1a3a1a",borderRadius:8,padding:"10px 14px",color:"#39ff14",fontSize:13,fontWeight:600}}>✓ You're signed up! See you there.</div>
+            )}
+            {success==="waitlist" && (
+              <div style={{background:"rgba(255,149,0,0.08)",border:"1px solid #3a2a00",borderRadius:8,padding:"10px 14px",color:"#ff9500",fontSize:13,fontWeight:600}}>⏳ Added to waitlist! We'll let you know if a spot opens.</div>
+            )}
+            {!success && (
+              <>
+                {full && <div style={{fontSize:12,color:"#ff9500",marginBottom:8,fontWeight:600}}>Class is full — join the waitlist below.</div>}
+                <button onClick={()=>setOpen(o=>!o)} style={{
+                  background: open ? "transparent" : full ? "linear-gradient(90deg,#ff9500,#e08000)" : "linear-gradient(90deg,#39ff14,#00cc00)",
+                  color: open ? (full?"#ff9500":"#39ff14") : "#000",
+                  border: open ? `1px solid ${full?"#ff9500":"#39ff14"}` : "none",
+                  borderRadius:8, padding:"8px 18px", fontWeight:800, fontSize:13, cursor:"pointer", letterSpacing:1
+                }}>
+                  {open ? "CANCEL" : full ? "JOIN WAITLIST" : "SIGN UP"}
+                </button>
+                {open && (
+                  <div style={{marginTop:12,display:"flex",flexDirection:"column",gap:8}}>
+                    <input placeholder="Full name" value={name} onChange={e=>setName(e.target.value)} style={S.input} />
+                    <input placeholder="Phone number" value={phone} onChange={e=>setPhone(formatPhone(e.target.value))} style={S.input} />
+                    {err && <div style={{color:"#ff3b3b",fontSize:12}}>{err}</div>}
+                    <button onClick={handleSignup} disabled={loading} style={{
+                      background: full ? "linear-gradient(90deg,#ff9500,#e08000)" : "linear-gradient(90deg,#39ff14,#00cc00)",
+                      color:"#000",border:"none",borderRadius:8,padding:"9px 0",fontWeight:800,fontSize:13,cursor:"pointer",
+                      display:"flex",alignItems:"center",justifyContent:"center",gap:8
+                    }}>
+                      {loading ? <Spinner /> : (full ? "JOIN WAITLIST" : "CONFIRM SIGNUP")}
+                    </button>
+                  </div>
+                )}
+              </>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ── PIN Gate ──────────────────────────────────────────────────────────────────
+function PinGate({ onSuccess, onBack, currentPin }) {
+  const [pin, setPin] = useState("");
+  const [err, setErr] = useState("");
+  const [shake, setShake] = useState(false);
+
+  function checkPin(p) {
+    if (p === currentPin) { onSuccess(); }
+    else { setErr("Incorrect PIN."); setShake(true); setPin(""); setTimeout(()=>setShake(false),500); }
+  }
+  function handleKey(k) {
+    if (k==="⌫") { setPin(p=>p.slice(0,-1)); return; }
+    if (pin.length>=4) return;
+    const next = pin+k;
+    setPin(next);
+    if (next.length===4) setTimeout(()=>checkPin(next),120);
+  }
+
+  return (
+    <div style={S.page}>
+      <link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&display=swap" rel="stylesheet" />
+      <style>{`@keyframes shake{0%,100%{transform:translateX(0)}25%{transform:translateX(-8px)}75%{transform:translateX(8px)}} @keyframes spin{to{transform:rotate(360deg)}}`}</style>
+      <div style={{maxWidth:360,margin:"0 auto",textAlign:"center",padding:"80px 16px 0"}}>
+        <div style={{fontFamily:"'Bebas Neue',sans-serif",fontSize:48,color:"#fff",letterSpacing:3}}>COACH <span style={{color:"#39ff14"}}>PORTAL</span></div>
+        <div style={{width:40,height:3,background:"#39ff14",margin:"16px auto 32px"}} />
+        <div style={{color:"#444",fontSize:13,letterSpacing:2,marginBottom:20}}>ENTER YOUR PIN</div>
+        <div style={{display:"flex",gap:8,justifyContent:"center",marginBottom:16,animation:shake?"shake 0.4s ease":"none"}}>
+          {[0,1,2,3].map(i=>(
+            <div key={i} style={{width:48,height:56,background:"#111",border:`1px solid ${pin.length>i?"#39ff14":"#1e1e1e"}`,borderRadius:10,display:"flex",alignItems:"center",justifyContent:"center",fontSize:24,color:"#39ff14",transition:"border-color 0.2s"}}>
+              {pin.length>i?"●":""}
+            </div>
+          ))}
+        </div>
+        {err && <div style={{color:"#ff3b3b",fontSize:12,marginBottom:12}}>{err}</div>}
+        <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:10,maxWidth:220,margin:"0 auto 24px"}}>
+          {[1,2,3,4,5,6,7,8,9,"",0,"⌫"].map((k,i)=>(
+            <button key={i} onClick={()=>k!==""&&handleKey(String(k))} style={{background:k===""?"transparent":"#141414",border:k===""?"none":"1px solid #1e1e1e",color:"#fff",borderRadius:10,padding:"14px 0",fontSize:18,fontWeight:700,cursor:k===""?"default":"pointer"}}
+              onMouseEnter={e=>{if(k!=="")e.currentTarget.style.background="#1e1e1e";}}
+              onMouseLeave={e=>{if(k!=="")e.currentTarget.style.background="#141414";}}
+            >{k}</button>
+          ))}
+        </div>
+        <button onClick={onBack} style={S.btnGhost}>← Back</button>
+      </div>
+    </div>
+  );
+}
+
+// ── Change PIN Modal ──────────────────────────────────────────────────────────
+function ChangePinModal({ currentPin, onSave, onClose }) {
+  const [step, setStep] = useState("current");
+  const [pin, setPin] = useState("");
+  const [newPin, setNewPin] = useState("");
+  const [err, setErr] = useState("");
+  const [shake, setShake] = useState(false);
+  const titles = { current:"Enter Current PIN", new:"Enter New PIN (4 digits)", confirm:"Confirm New PIN" };
+
+  function handleKey(k) {
+    if (k==="⌫") { setPin(p=>p.slice(0,-1)); setErr(""); return; }
+    if (pin.length>=4) return;
+    const next = pin+k;
+    setPin(next);
+    if (next.length===4) setTimeout(()=>{
+      if (step==="current") {
+        if (next===currentPin) { setStep("new"); setPin(""); setErr(""); }
+        else { setErr("Incorrect PIN."); setShake(true); setPin(""); setTimeout(()=>setShake(false),500); }
+      } else if (step==="new") {
+        setNewPin(next); setStep("confirm"); setPin(""); setErr("");
+      } else {
+        if (next===newPin) { onSave(newPin); }
+        else { setErr("PINs don't match."); setShake(true); setPin(""); setNewPin(""); setStep("new"); setTimeout(()=>setShake(false),500); }
+      }
+    },120);
+  }
+
+  return (
+    <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.9)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:100}}>
+      <div style={{background:"#111",border:"1px solid #1e1e1e",borderRadius:16,padding:"36px 32px",textAlign:"center",minWidth:300}}>
+        <div style={{fontFamily:"'Bebas Neue',sans-serif",fontSize:22,color:"#fff",letterSpacing:2,marginBottom:4}}>CHANGE PIN</div>
+        <div style={{color:"#444",fontSize:13,marginBottom:24}}>{titles[step]}</div>
+        <div style={{display:"flex",gap:8,justifyContent:"center",marginBottom:16,animation:shake?"shake 0.4s ease":"none"}}>
+          {[0,1,2,3].map(i=>(
+            <div key={i} style={{width:44,height:52,background:"#0d0d0d",border:`1px solid ${pin.length>i?"#39ff14":"#1e1e1e"}`,borderRadius:8,display:"flex",alignItems:"center",justifyContent:"center",fontSize:22,color:"#39ff14"}}>
+              {pin.length>i?"●":""}
+            </div>
+          ))}
+        </div>
+        {err && <div style={{color:"#ff3b3b",fontSize:12,marginBottom:10}}>{err}</div>}
+        <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:8,maxWidth:200,margin:"0 auto 20px"}}>
+          {[1,2,3,4,5,6,7,8,9,"",0,"⌫"].map((k,i)=>(
+            <button key={i} onClick={()=>k!==""&&handleKey(String(k))} style={{background:k===""?"transparent":"#141414",border:k===""?"none":"1px solid #1e1e1e",color:"#fff",borderRadius:8,padding:"12px 0",fontSize:16,fontWeight:700,cursor:k===""?"default":"pointer"}}
+              onMouseEnter={e=>{if(k!=="")e.currentTarget.style.background="#1e1e1e";}}
+              onMouseLeave={e=>{if(k!=="")e.currentTarget.style.background="#141414";}}
+            >{k}</button>
+          ))}
+        </div>
+        <button onClick={onClose} style={S.btnGhost}>Cancel</button>
+      </div>
+    </div>
+  );
+}
+
+// ── Main App ──────────────────────────────────────────────────────────────────
+export default function App() {
+  const [mode, setMode] = useState(null);
+  const [coachUnlocked, setCoachUnlocked] = useState(false);
+  const [coachPin, setCoachPin] = useState(() => { try { return JSON.parse(localStorage.getItem(PIN_STORAGE_KEY)) || DEFAULT_PIN; } catch { return DEFAULT_PIN; } });
+  const [classes, setClasses] = useState([]);
+  const [signups, setSignups] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [debugMsg, setDebugMsg] = useState("");
+  const [showForm, setShowForm] = useState(false);
+  const [showPinChange, setShowPinChange] = useState(false);
+  const [pinChanged, setPinChanged] = useState(false);
+  const [form, setForm] = useState({ title:"", date:"", time:"", duration:"60", capacity:"12", coach:"", description:"" });
+  const [formErr, setFormErr] = useState("");
+  const [formLoading, setFormLoading] = useState(false);
+
+  const fetchData = useCallback(async () => {
+    setLoading(true);
+    setDebugMsg("Fetching from Supabase...");
+    try {
+      const [cls, sigs] = await Promise.all([
+        sbGet("classes", "?order=date.asc,time.asc"),
+        sbGet("signups", "?order=id.asc")
+      ]);
+      setClasses(cls);
+      setSignups(sigs);
+      setDebugMsg(`✓ Loaded ${cls.length} class(es), ${sigs.length} signup(s).`);
+    } catch(e) {
+      setDebugMsg(`✗ Error: ${e.message}`);
+      console.error(e);
+    }
+    setLoading(false);
+  }, []);
+
+  useEffect(() => { if (mode && (mode === "student" || coachUnlocked)) fetchData(); }, [mode, coachUnlocked]);
+
+  async function createClass() {
+    if (!form.title.trim() || !form.date || !form.time) return setFormErr("Title, date, and time are required.");
+    setFormLoading(true);
+    try {
+      await sbPost("classes", {
+        id: Date.now().toString(),
+        title: form.title.trim(),
+        date: form.date, time: form.time,
+        duration: parseInt(form.duration)||60,
+        capacity: parseInt(form.capacity)||12,
+        coach: form.coach.trim(),
+        description: form.description.trim()
+      });
+      setForm({ title:"", date:"", time:"", duration:"60", capacity:"12", coach:"", description:"" });
+      setShowForm(false); setFormErr("");
+      fetchData();
+    } catch(e) { setFormErr("Failed to save. Try again."); }
+    setFormLoading(false);
+  }
+
+  function handlePinSave(newPin) {
+    setCoachPin(newPin);
+    localStorage.setItem(PIN_STORAGE_KEY, JSON.stringify(newPin));
+    setShowPinChange(false);
+    setPinChanged(true);
+    setTimeout(()=>setPinChanged(false), 3000);
+  }
+
+  // Landing
+  if (!mode) return (
+    <div style={S.page}>
+      <link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&display=swap" rel="stylesheet" />
+      <style>{`@keyframes spin{to{transform:rotate(360deg)}}`}</style>
+      <div style={{maxWidth:440,margin:"0 auto",textAlign:"center",padding:"80px 16px 0"}}>
+        <div style={{fontSize:12,color:"#39ff14",letterSpacing:5,fontWeight:700,marginBottom:16}}>WELCOME TO</div>
+        <h1 style={{fontFamily:"'Bebas Neue',sans-serif",fontSize:76,color:"#fff",margin:0,lineHeight:0.85,letterSpacing:3}}>
+          LETHAL<br /><span style={{color:"#39ff14",WebkitTextStroke:"1px #00cc00"}}>BOXING</span>
+        </h1>
+        <div style={{width:60,height:3,background:"linear-gradient(90deg,#39ff14,#00cc00)",margin:"28px auto"}} />
+        <p style={{color:"#444",fontSize:14,marginBottom:48,letterSpacing:1}}>Select your role to continue.</p>
+        <div style={{display:"flex",gap:16,justifyContent:"center"}}>
+          {[["COACH","coach","🥊","Manage classes & rosters"],["STUDENT","student","🏋️","Browse & sign up for classes"]].map(([label,val,icon,sub])=>(
+            <button key={val} onClick={()=>setMode(val)} style={{background:"linear-gradient(135deg,#121212,#0a0a0a)",border:"1px solid #1a1a1a",borderRadius:14,padding:"28px 32px",color:"#fff",cursor:"pointer",transition:"all 0.2s",flex:1,textAlign:"center"}}
+              onMouseEnter={e=>{e.currentTarget.style.borderColor="#39ff14";e.currentTarget.style.boxShadow="0 0 32px rgba(57,255,20,0.12)";}}
+              onMouseLeave={e=>{e.currentTarget.style.borderColor="#1a1a1a";e.currentTarget.style.boxShadow="none";}}>
+              <div style={{fontSize:32,marginBottom:8}}>{icon}</div>
+              <div style={{fontFamily:"'Bebas Neue',sans-serif",fontSize:28,letterSpacing:2}}>{label}</div>
+              <div style={{color:"#444",fontSize:12,marginTop:4}}>{sub}</div>
+            </button>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+
+  if (mode==="coach" && !coachUnlocked)
+    return <PinGate currentPin={coachPin} onSuccess={()=>setCoachUnlocked(true)} onBack={()=>setMode(null)} />;
+
+  return (
+    <div style={S.page}>
+      <link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&display=swap" rel="stylesheet" />
+      <style>{`@keyframes spin{to{transform:rotate(360deg)}} @keyframes shake{0%,100%{transform:translateX(0)}25%{transform:translateX(-8px)}75%{transform:translateX(8px)}}`}</style>
+      {showPinChange && <ChangePinModal currentPin={coachPin} onSave={handlePinSave} onClose={()=>setShowPinChange(false)} />}
+
+      <div style={{maxWidth:720,margin:"0 auto",padding:"0 16px 60px"}}>
+        {/* Nav */}
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"24px 0 32px"}}>
+          <div>
+            <div style={{fontFamily:"'Bebas Neue',sans-serif",fontSize:36,color:"#fff",letterSpacing:3,lineHeight:1}}>
+              LETHAL <span style={{color:"#39ff14"}}>BOXING</span>
+            </div>
+            <div style={{fontSize:11,color:"#333",letterSpacing:2,marginTop:2}}>{mode==="coach"?"🔒 COACH PORTAL":"CLASS SCHEDULE"}</div>
+          </div>
+          <div style={{display:"flex",gap:8}}>
+            {mode==="coach" && <button onClick={()=>setShowPinChange(true)} style={{...S.btnGhost,color:"#888"}}>🔑 PIN</button>}
+            <button onClick={()=>{setMode(null);setCoachUnlocked(false);}} style={S.btnGhost}>← EXIT</button>
+          </div>
+        </div>
+
+        {debugMsg && (
+          <div style={{background: debugMsg.startsWith("✓") ? "rgba(57,255,20,0.06)" : "rgba(255,59,59,0.08)", border: `1px solid ${debugMsg.startsWith("✓") ? "#1a3a1a" : "#3a1a1a"}`, borderRadius:8, padding:"8px 14px", color: debugMsg.startsWith("✓") ? "#39ff14" : "#ff6b6b", fontSize:12, marginBottom:16, fontFamily:"monospace"}}>
+            {debugMsg}
+          </div>
+        )}
+
+        {pinChanged && (
+          <div style={{background:"rgba(57,255,20,0.06)",border:"1px solid #1a3a1a",borderRadius:8,padding:"10px 16px",color:"#39ff14",fontSize:13,fontWeight:600,marginBottom:20}}>
+            ✓ PIN updated successfully!
+          </div>
+        )}
+
+        {/* Create class form */}
+        {mode==="coach" && (
+          <div style={{marginBottom:32}}>
+            {!showForm ? (
+              <button onClick={()=>setShowForm(true)} style={{...S.btnGreen,fontFamily:"'Bebas Neue',sans-serif",fontSize:20,letterSpacing:1.5,padding:"13px 28px"}}>
+                + CREATE CLASS
+              </button>
+            ) : (
+              <div style={{background:"#0e0e0e",border:"1px solid #1e1e1e",borderRadius:12,padding:24}}>
+                <div style={{fontFamily:"'Bebas Neue',sans-serif",fontSize:24,color:"#fff",letterSpacing:2,marginBottom:20}}>NEW CLASS</div>
+                <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
+                  {[["Class Title","title","text","e.g. Beginner Sparring"],["Coach Name","coach","text","optional"],["Date","date","date",""],["Time","time","time",""],["Duration (min)","duration","number","60"],["Max Students","capacity","number","12"]].map(([label,key,type,ph])=>(
+                    <div key={key}>
+                      <div style={{fontSize:11,color:"#444",letterSpacing:1,marginBottom:4}}>{label.toUpperCase()}</div>
+                      <input type={type} placeholder={ph} value={form[key]} onChange={e=>setForm(f=>({...f,[key]:e.target.value}))} style={S.input} />
+                    </div>
+                  ))}
+                </div>
+                <div style={{marginTop:12}}>
+                  <div style={{fontSize:11,color:"#444",letterSpacing:1,marginBottom:4}}>CLASS DESCRIPTION</div>
+                  <textarea placeholder="Skill level, what to bring, what to expect..." value={form.description}
+                    onChange={e=>setForm(f=>({...f,description:e.target.value}))} rows={3}
+                    style={{...S.input,resize:"vertical",lineHeight:1.6}} />
+                </div>
+                {formErr && <div style={{color:"#ff3b3b",fontSize:12,marginTop:8}}>{formErr}</div>}
+                <div style={{display:"flex",gap:10,marginTop:16}}>
+                  <button onClick={createClass} disabled={formLoading} style={{...S.btnGreen,display:"flex",alignItems:"center",gap:8}}>
+                    {formLoading ? <Spinner /> : "SAVE CLASS"}
+                  </button>
+                  <button onClick={()=>{setShowForm(false);setFormErr("");}} style={S.btnGhost}>Cancel</button>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Class list */}
+        {loading ? (
+          <div style={{display:"flex",justifyContent:"center",paddingTop:60}}><Spinner /></div>
+        ) : classes.length===0 ? (
+          <div style={{textAlign:"center",color:"#2a2a2a",fontSize:15,paddingTop:60}}>
+            {mode==="coach" ? "No upcoming classes. Create one above." : "No classes scheduled yet. Check back soon!"}
+          </div>
+        ) : (
+          <div style={{display:"flex",flexDirection:"column",gap:16}}>
+            {classes.map(cls=>(
+              <ClassCard key={cls.id} cls={cls} signups={signups} isCoach={mode==="coach"} onRefresh={fetchData} />
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+import React from 'react'
+import ReactDOM from 'react-dom/client'
+import App from './App'
+
+ReactDOM.createRoot(document.getElementById('root')).render(
+  <React.StrictMode>
+    <App />
+  </React.StrictMode>
+)
